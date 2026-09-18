@@ -1,0 +1,192 @@
+# No restocks, only releases
+from random_user_agent.params import SoftwareName, HardwareType
+from random_user_agent.user_agent import UserAgent
+
+from bs4 import BeautifulSoup
+import requests
+from curl_cffi import requests as cf
+import urllib3
+import re
+from fp.fp import FreeProxy
+
+from datetime import datetime, timezone
+import time
+
+import json
+import logging
+import traceback
+
+from config import WEBHOOK, ENABLE_FREE_PROXY, FREE_PROXY_LOCATION, DELAY, PROXY, KEYWORDS, USERNAME, AVATAR_URL, COLOUR
+
+logging.basicConfig(filename='zalando-monitor.log', filemode='a', format='%(asctime)s - %(name)s - %(message)s',
+                    level=logging.DEBUG)
+
+software_names = [SoftwareName.CHROME.value]
+hardware_type = [HardwareType.MOBILE__PHONE]
+user_agent_rotator = UserAgent(software_names=software_names, hardware_type=hardware_type)
+
+if ENABLE_FREE_PROXY:
+    proxy_obj = FreeProxy(country_id=FREE_PROXY_LOCATION, rand=True)
+
+INSTOCK = []
+
+def scrape_main_site(headers, proxy):
+    """
+    Scrape the Zalando site and adds each item to an array
+    """
+    items = []
+
+    for page in [1, 2]:
+        url = f'https://www.zalando.co.uk/mens-shoes-trainers/?p={page}&order=activation_date'
+        # Zalando sits behind Akamai; curl_cffi's TLS impersonation gets a
+        # browser-like response where plain requests is blocked.
+        html = cf.get(url, impersonate='chrome', proxies=proxy if proxy else None, timeout=20)
+        soup = BeautifulSoup(html.text, 'html.parser')
+        # Read stable <article> tiles instead of Zalando's obfuscated CSS classes.
+        products = soup.find_all('article')
+
+        for product in products:
+            try:
+                link = product.find('a', href=True)
+                if not link:
+                    continue
+                heading = product.find(['h3', 'h2'])
+                parts = list(heading.stripped_strings) if heading else []
+                brand = parts[0] if parts else ''
+                name = parts[1] if len(parts) > 1 else brand
+                price = re.search(r'[£€$]\s?[\d.,]+', product.get_text(' '))
+                image = product.find('img')
+                item = [
+                    name,                                                # name
+                    link['href'],                                        # url
+                    brand,                                               # brand
+                    price.group(0) if price else '',                     # price
+                    image['src'] if image and image.get('src') else ''   # image
+                ]
+                items.append(item)
+            except (AttributeError, TypeError, KeyError):
+                logging.debug(traceback.format_exc())
+
+        time.sleep(0.5)
+    return items
+
+
+def discord_webhook(product):
+    """
+    Sends a Discord webhook notification to the specified webhook URL
+    """
+    data = {
+        "username": USERNAME,
+        "avatar_url": AVATAR_URL,
+        "embeds": [{
+            "title": product[0],
+            "url": product[1],
+            "thumbnail": {"url": product[4]},
+            "color": int(COLOUR),
+            "footer": {"text": "Developed by GitHub:yasserqureshi1"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "fields": [
+                {"name": "Brand", "value": product[2]},
+                {"name": "Price", "value": product[3]}
+            ]
+
+        }]
+    }
+
+    result = requests.post(WEBHOOK, data=json.dumps(data), headers={"Content-Type": "application/json"})
+
+    try:
+        result.raise_for_status()
+    except requests.exceptions.HTTPError as err:
+        print(err)
+        logging.error(msg=err)
+    else:
+        print("Payload delivered successfully, code {}.".format(result.status_code))
+        logging.info("Payload delivered successfully, code {}.".format(result.status_code))
+
+
+def comparitor(item, start):
+    if item not in INSTOCK:
+        # If product is available but not stored - sends notification and stores
+        INSTOCK.append(item)
+        if start == 0:
+            print(item)
+            discord_webhook(item)
+
+
+def monitor():
+    """
+    Initiates monitor
+    """
+    print('''\n-----------------------------------
+--- ZALANDO MONITOR HAS STARTED ---
+-----------------------------------\n''')
+    logging.info(msg='Successfully started monitor')
+
+    # Ensures that first scrape does not notify all products
+    start = 1
+
+    # Initialising proxy and headers
+    if ENABLE_FREE_PROXY:
+        proxy = {'http': proxy_obj.get()}
+    elif PROXY != []:
+        proxy_no = 0
+        proxy = {} if PROXY == [] else {"http": PROXY[proxy_no], "https": PROXY[proxy_no]}
+    else:
+        proxy = {}
+   
+    headers = {
+        'User-Agent': user_agent_rotator.get_random_user_agent(),
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
+        'accept-encoding': 'gzip, deflate, br',
+        'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0'
+    }
+    
+    while True:
+        try:
+            # Makes request to site and stores products 
+            items = scrape_main_site(headers, proxy)
+            for item in items:
+
+                if KEYWORDS == []:
+                    # If no keywords set, checks whether item status has changed
+                    comparitor(item, start)
+
+                else:
+                    # For each keyword, checks whether particular item status has changed
+                    for key in KEYWORDS:
+                        if key.lower() in item[0].lower():
+                            comparitor(item, start)
+
+            # Allows changes to be notified
+            start = 0
+            
+        except requests.exceptions.RequestException as e:
+            logging.error(e)
+            logging.info('Rotating headers and proxy')
+
+            # Rotates headers
+            headers['User-Agent'] = user_agent_rotator.get_random_user_agent()
+        
+            if ENABLE_FREE_PROXY:
+                proxy = {'http': proxy_obj.get()}
+
+            elif PROXY != []:
+                proxy_no = 0 if proxy_no == (len(PROXY)-1) else proxy_no + 1
+                proxy = {"http": PROXY[proxy_no], "https": PROXY[proxy_no]}
+
+        
+        except Exception as e:
+            print(f"Exception found: {traceback.format_exc()}")
+            logging.error(e)
+
+        # User set delay
+        time.sleep(float(DELAY))
+
+
+if __name__ == '__main__':
+    urllib3.disable_warnings()
+    monitor()
