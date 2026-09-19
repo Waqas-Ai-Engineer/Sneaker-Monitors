@@ -61,7 +61,3 @@ python monitor.py
 ```
 
 The monitor keeps checking for as long as it's running. Leave the terminal open, or host it on a server to run 24/7 ([server tutorial](https://youtu.be/nmUSSlt4JKk)). It's best to test on your own computer first.
-
-## License
-
-Distributed under the GNU General Public License v3.0. See `LICENSE` for details. Selling this code without consent is strictly prohibited; any shared or updated copy of this repo must remain freely available.
